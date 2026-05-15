@@ -10,66 +10,22 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 import re
 
-# --- Math rendering helpers (formatting only; no model logic changes) ---
-
-def _normalize_latex_delimiters(text: str) -> str:
-    """Normalize unsupported LaTeX delimiters to $ / $$ as required."""
-    if not text:
-        return text
-    # Replace \[ ... \] -> $$ ... $$
-    text = re.sub(r"\\\[(.*?)\\\]", r"$$\1$$", text, flags=re.DOTALL)
-    # Replace \( ... \) -> $ ... $
-    text = re.sub(r"\\\((.*?)\\\)", r"$\1$", text, flags=re.DOTALL)
-    # Replace standalone [ ... ] lines -> $$ ... $$
-    text = re.sub(r"^\s*\[\s*(.*?)\s*\]\s*$", r"$$\1$$", text, flags=re.MULTILINE | re.DOTALL)
-    return text
-
-
-def _fix_common_pdf_math_artifacts(text: str) -> str:
-    """Fix common PDF-extracted math artifacts that break Markdown/KaTeX rendering."""
-    if not text:
-        return text
-
-    # Collapse excessive $$ (e.g., '$$$$')
-    text = re.sub(r"\${3,}", "$$", text)
-
-    # If model emits trailing $$ with no opening (rare), avoid empty blocks
-    text = re.sub(r"\$\$\s*\$\$", "", text)
-
-    # Inside block math, normalize common linebreak tokens
-    def _clean_block(m: re.Match) -> str:
-        inner = m.group(1)
-        inner = inner.replace("\\[4pt]", "\\\\[4pt]")
-        inner = inner.replace("\\\\n", "\\\\")  # literal \n -> \\\\
-        inner = inner.replace("\n", "\\\\\n")
-        inner = inner.strip()
-        return f"$$\n{inner}\n$$"
-
-    text = re.sub(r"\$\$(.*?)\$\$", _clean_block, text, flags=re.DOTALL)
-
-    # Heuristic: if a block ends with '\end{cases}$$' but is missing '\begin{cases}', wrap it.
-    # This fixes outputs like: '\frac{1}{2}... \end{cases}$$'
-    def _add_missing_begin_cases(m: re.Match) -> str:
-        inner = m.group(1)
-        # Already has begin{cases}
-        if re.search(r"\\begin\s*\{cases\}", inner):
-            return m.group(0)
-        # Contains end{cases} and case separators
-        if re.search(r"\\end\s*\{cases\}", inner) and ("&" in inner or "\\\\" in inner):
-            inner2 = "\\begin{cases}\n" + inner
-            return f"$$\n{inner2.strip()}\n$$"
-        return m.group(0)
-
-    text = re.sub(r"\$\$(.*?)\$\$", _add_missing_begin_cases, text, flags=re.DOTALL)
-
-    return text
-
+# --- Simple Math Cleaner (formatting only; no model logic changes) ---
 
 def format_math_for_streamlit(text: str) -> str:
-    """Best-effort math formatting while preserving content."""
-    text = _normalize_latex_delimiters(text)
-    text = _fix_common_pdf_math_artifacts(text)
-    return text
+    """Normalize math delimiters so Streamlit renders equations more reliably."""
+    if not text:
+        return text
+
+    cleaned_text = text
+    # Replace block math brackets with $$
+    cleaned_text = re.sub(r"\\\[(.*?)\\\]", r"$$\1$$", cleaned_text, flags=re.DOTALL)
+    # Replace inline math brackets with $
+    cleaned_text = re.sub(r"\\\((.*?)\\\)", r"$\1$", cleaned_text, flags=re.DOTALL)
+    # Catch plain brackets used for block equations
+    cleaned_text = re.sub(r"^\s*\[\s*(.*?)\s*\]\s*$", r"$$\1$$", cleaned_text, flags=re.MULTILINE | re.DOTALL)
+
+    return cleaned_text
 
 load_dotenv()
 groq_api_key = os.getenv("GROQ_API_KEY")
@@ -198,7 +154,7 @@ In this mode:
 Example:
 $$
 \text{FFN}(x) = \text{ReLU}(x W_1 + b_1) W_2 + b_2
-$$
+$$"
 """
             
             # --- RAG Routing Logic ---
@@ -257,7 +213,7 @@ Context:
             # Generate and display response
             response = llm.invoke(final_messages)
 
-            # --- Math/LaTeX formatting (rendering only) ---
+            # --- Simple Math Cleaner ---
             cleaned_text = format_math_for_streamlit(response.content)
 
             st.markdown(cleaned_text)
