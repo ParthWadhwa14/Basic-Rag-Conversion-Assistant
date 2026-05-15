@@ -10,3 +10,4 @@ langchain-chroma
 pymupdf
 sentence-transformers
 torchvision
+protobuf<5.0.0
