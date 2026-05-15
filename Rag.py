@@ -1,0 +1,266 @@
+import streamlit as st
+import os
+import tempfile
+from dotenv import load_dotenv
+from langchain_groq import ChatGroq
+from langchain_community.document_loaders import PyMuPDFLoader, CSVLoader, TextLoader
+from langchain_chroma import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+import re
+
+# --- Math rendering helpers (formatting only; no model logic changes) ---
+
+def _normalize_latex_delimiters(text: str) -> str:
+    """Normalize unsupported LaTeX delimiters to $ / $$ as required."""
+    if not text:
+        return text
+    # Replace \[ ... \] -> $$ ... $$
+    text = re.sub(r"\\\[(.*?)\\\]", r"$$\1$$", text, flags=re.DOTALL)
+    # Replace \( ... \) -> $ ... $
+    text = re.sub(r"\\\((.*?)\\\)", r"$\1$", text, flags=re.DOTALL)
+    # Replace standalone [ ... ] lines -> $$ ... $$
+    text = re.sub(r"^\s*\[\s*(.*?)\s*\]\s*$", r"$$\1$$", text, flags=re.MULTILINE | re.DOTALL)
+    return text
+
+
+def _fix_common_pdf_math_artifacts(text: str) -> str:
+    """Fix common PDF-extracted math artifacts that break Markdown/KaTeX rendering."""
+    if not text:
+        return text
+
+    # Collapse excessive $$ (e.g., '$$$$')
+    text = re.sub(r"\${3,}", "$$", text)
+
+    # If model emits trailing $$ with no opening (rare), avoid empty blocks
+    text = re.sub(r"\$\$\s*\$\$", "", text)
+
+    # Inside block math, normalize common linebreak tokens
+    def _clean_block(m: re.Match) -> str:
+        inner = m.group(1)
+        inner = inner.replace("\\[4pt]", "\\\\[4pt]")
+        inner = inner.replace("\\\\n", "\\\\")  # literal \n -> \\\\
+        inner = inner.replace("\n", "\\\\\n")
+        inner = inner.strip()
+        return f"$$\n{inner}\n$$"
+
+    text = re.sub(r"\$\$(.*?)\$\$", _clean_block, text, flags=re.DOTALL)
+
+    # Heuristic: if a block ends with '\end{cases}$$' but is missing '\begin{cases}', wrap it.
+    # This fixes outputs like: '\frac{1}{2}... \end{cases}$$'
+    def _add_missing_begin_cases(m: re.Match) -> str:
+        inner = m.group(1)
+        # Already has begin{cases}
+        if re.search(r"\\begin\s*\{cases\}", inner):
+            return m.group(0)
+        # Contains end{cases} and case separators
+        if re.search(r"\\end\s*\{cases\}", inner) and ("&" in inner or "\\\\" in inner):
+            inner2 = "\\begin{cases}\n" + inner
+            return f"$$\n{inner2.strip()}\n$$"
+        return m.group(0)
+
+    text = re.sub(r"\$\$(.*?)\$\$", _add_missing_begin_cases, text, flags=re.DOTALL)
+
+    return text
+
+
+def format_math_for_streamlit(text: str) -> str:
+    """Best-effort math formatting while preserving content."""
+    text = _normalize_latex_delimiters(text)
+    text = _fix_common_pdf_math_artifacts(text)
+    return text
+
+load_dotenv()
+groq_api_key = os.getenv("GROQ_API_KEY")
+
+class Chunking:
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.docs = []
+        self.text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=20)
+
+    def load_file(self):
+        extension = os.path.splitext(self.file_path)[1].lower()
+        if extension == ".txt":
+            self.docs = TextLoader(self.file_path).load()
+        elif extension == ".csv":
+            self.docs = CSVLoader(self.file_path).load()
+        elif extension == ".pdf":
+            self.docs = PyMuPDFLoader(self.file_path).load()
+        else:
+            st.error("Unsupported file format")
+            return None
+        return self.docs
+
+    def create_chunks(self):
+        if not self.docs:
+            return []
+        return self.text_splitter.split_documents(self.docs)
+
+class VectorDatabase:
+    def __init__(self, documents):
+        self.documents = documents
+
+    def create_embeddings(self):
+        embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+        return Chroma.from_documents(self.documents, embeddings)
+
+# --- 1. Session State Initialization ---
+# This ensures variables survive when Streamlit reruns the script
+if "messages" not in st.session_state:
+    st.session_state.messages = [] # Stores chat history
+
+if "vector_db" not in st.session_state:
+    st.session_state.vector_db = None # Stores the embedded documents
+
+# --- 2. Sidebar for File Uploading ---
+# We use a button to trigger the embedding process so it only happens ONCE
+with st.sidebar:
+    st.header("Document Knowledge")
+    uploaded_file = st.file_uploader("Upload your file here", type=['pdf', 'txt', 'csv'])
+    
+    if st.button("Process Document"):
+        if uploaded_file is not None:
+            with st.spinner("Chunking and Embedding Document..."):
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
+                    tmp_file.write(uploaded_file.getvalue())
+                    tmp_path = tmp_file.name
+
+                chunking_obj = Chunking(tmp_path)
+                if chunking_obj.load_file():
+                    documents = chunking_obj.create_chunks()
+                    embedding_obj = VectorDatabase(documents)
+                    
+                    # Save the database into session_state!
+                    st.session_state.vector_db = embedding_obj.create_embeddings()
+                    st.success("Document processed! You can now ask questions about it.")
+                
+                os.remove(tmp_path)
+        else:
+            st.warning("Please upload a file first.")
+            
+    if st.button("Clear Chat History"):
+        st.session_state.messages = []
+
+# --- 3. Main UI and Chat Logic ---
+st.title("Conversational AI & RAG")
+
+# Display previous chat messages
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# Wait for user input
+if prompt := st.chat_input("Ask a question (with or without a document)..."):
+    
+    # Immediately display user message
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            
+            # Initialize the LLM (Using the updated, supported Groq model)
+            llm = ChatGroq(model="openai/gpt-oss-120b", groq_api_key=groq_api_key)
+            
+            # Reconstruct conversational memory for LangChain
+            chat_history_objects = []
+            for msg in st.session_state.messages[:-1]: # All messages except the current prompt
+                if msg["role"] == "user":
+                    chat_history_objects.append(HumanMessage(content=msg["content"]))
+                else:
+                    chat_history_objects.append(AIMessage(content=msg["content"]))
+
+            # Default System Prompt (No Document)
+            # Default System Prompt (No Document)
+            system_prompt_text = """You are a highly intelligent, versatile, and friendly AI assistant. Your goal is to provide accurate, well-structured, and engaging answers to any question the user asks. If:
+- no documents are retrieved,
+- retrieval confidence is low,
+- vector search returns empty results,
+- or the user asks a general question unrelated to uploaded documents,
+
+then switch automatically into GENERAL AI ASSISTANT MODE.
+
+In this mode:
+- Use your internal reasoning and knowledge.
+- Provide the best possible answer.
+- Be transparent that the response is based on general knowledge rather than retrieved documents.
+- Do not pretend the information came from uploaded files.
+
+
+### MATH FORMATTING RULES (CRITICAL):
+1. TRANSLATION: The provided context may contain poorly formatted math extracted from a PDF (e.g., 'h×dk=8×64'). You MUST actively translate these into proper, beautifully formatted LaTeX.
+2. DELIMITERS: You are STRICTLY FORBIDDEN from using `\[ \]`, `\( \)`, or plain `[ ]` to wrap equations. 
+3. INLINE MATH: Wrap all variables and inline math exclusively in single dollar signs (e.g., $d_{model} = 512$).
+4. BLOCK MATH: Wrap all standalone equations exclusively in double dollar signs.
+Example:
+$$
+\text{FFN}(x) = \text{ReLU}(x W_1 + b_1) W_2 + b_2
+$$
+"""
+            
+            # --- RAG Routing Logic ---
+            if st.session_state.vector_db is not None:
+                retriever = st.session_state.vector_db.as_retriever()
+                relevant_docs = retriever.invoke(prompt)
+                context = "\n\n".join([doc.page_content for doc in relevant_docs])
+                
+                system_prompt_text = """You are an advanced Retrieval-Augmented Generation (RAG) AI assistant.
+
+Your purpose is to provide highly accurate, context-aware, grounded, and intelligent responses using the retrieved knowledge provided to you.
+
+You MUST follow these rules strictly:
+
+========================
+CORE BEHAVIOR
+========================
+
+1. Always prioritize retrieved context over prior knowledge.
+2. Never hallucinate facts not present in the retrieved documents or verified web sources.
+3. If the answer is not available in the provided context, clearly say:
+   "I could not find sufficient information in the provided documents."
+4. Use reasoning to combine information across multiple chunks/documents when necessary.
+5. Maintain conversational continuity and memory across interactions.
+6. Be concise for simple queries and detailed for complex ones.
+7. Explain technical concepts step-by-step when appropriate.
+8. If ambiguity exists, ask clarifying questions before answering.
+9. Distinguish clearly between:
+   - Retrieved facts
+   - Assumptions
+   - General knowledge
+   - Suggestions/opinions
+
+
+### MATH FORMATTING RULES (CRITICAL):
+1. TRANSLATION: The provided context may contain poorly formatted math extracted from a PDF (e.g., 'h×dk=8×64'). You MUST actively translate these into proper, beautifully formatted LaTeX.
+2. DELIMITERS: You are STRICTLY FORBIDDEN from using `\[ \]`, `\( \)`, or plain `[ ]` to wrap equations. 
+3. INLINE MATH: Wrap all variables and inline math exclusively in single dollar signs (e.g., $d_{model} = 512$).
+4. BLOCK MATH: Wrap all standalone equations exclusively in double dollar signs.
+Example:
+$$
+\text{FFN}(x) = \text{ReLU}(x W_1 + b_1) W_2 + b_2
+$$
+
+Context:
+{context}
+"""
+            
+            # Build final prompt package: System constraints + Memory + Current Question
+            final_messages = [
+                SystemMessage(content=system_prompt_text),
+                *chat_history_objects,
+                HumanMessage(content=prompt)
+            ]
+            
+            # Generate and display response
+            response = llm.invoke(final_messages)
+
+            # --- Math/LaTeX formatting (rendering only) ---
+            cleaned_text = format_math_for_streamlit(response.content)
+
+            st.markdown(cleaned_text)
+
+            # Save the AI's cleaned response to session state memory
+            st.session_state.messages.append({"role": "assistant", "content": cleaned_text})
