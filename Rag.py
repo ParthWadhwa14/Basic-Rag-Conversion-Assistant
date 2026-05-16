@@ -129,82 +129,51 @@ if prompt := st.chat_input("Ask a question (with or without a document)..."):
                 else:
                     chat_history_objects.append(AIMessage(content=msg["content"]))
 
-            # Default System Prompt (No Document)
-            # Default System Prompt (No Document)
-            system_prompt_text = """You are a highly intelligent, versatile, and friendly AI assistant. Your goal is to provide accurate, well-structured, and engaging answers to any question the user asks. If:
-- no documents are retrieved,
-- retrieval confidence is low,
-- vector search returns empty results,
-- or the user asks a general question unrelated to uploaded documents,
 
-then switch automatically into GENERAL AI ASSISTANT MODE.
+            system_prompt_text = """You are a highly intelligent, versatile, and friendly AI assistant. Your goal is to provide accurate, well-structured, and engaging answers.
 
 In this mode:
 - Use your internal reasoning and knowledge.
-- Provide the best possible answer.
-- Be transparent that the response is based on general knowledge rather than retrieved documents.
-- Do not pretend the information came from uploaded files.
-
+- Be transparent that the response is based on general knowledge.
 
 ### MATH FORMATTING RULES (CRITICAL):
-1. TRANSLATION: The provided context may contain poorly formatted math extracted from a PDF (e.g., 'h×dk=8×64'). You MUST actively translate these into proper, beautifully formatted LaTeX.
+1. TRANSLATION: You MUST actively translate ugly math text into proper LaTeX.
 2. DELIMITERS: You are STRICTLY FORBIDDEN from using `\[ \]`, `\( \)`, or plain `[ ]` to wrap equations. 
-3. INLINE MATH: Wrap all variables and inline math exclusively in single dollar signs (e.g., $d_{model} = 512$).
+3. INLINE MATH: Wrap all variables and inline math exclusively in single dollar signs (e.g., $d_{{model}} = 512$).
 4. BLOCK MATH: Wrap all standalone equations exclusively in double dollar signs.
 Example:
 $$
-\text{FFN}(x) = \text{ReLU}(x W_1 + b_1) W_2 + b_2
-$$"
+\text{{FFN}}(x) = \text{{ReLU}}(x W_1 + b_1) W_2 + b_2
+$$
 """
             
-            # --- RAG Routing Logic ---
+            # ==========================================
+            # 2. RAG OVERRIDE PROMPT (DOCUMENT UPLOADED)
+            # ==========================================
             if st.session_state.vector_db is not None:
                 retriever = st.session_state.vector_db.as_retriever()
                 relevant_docs = retriever.invoke(prompt)
                 context = "\n\n".join([doc.page_content for doc in relevant_docs])
                 
-                system_prompt_text = """You are an advanced Retrieval-Augmented Generation (RAG) AI assistant.
-
-Your purpose is to provide highly accurate, context-aware, grounded, and intelligent responses using the retrieved knowledge provided to you.
-
-You MUST follow these rules strictly:
+                # IMPORTANT: Notice the 'f' before the triple quotes! 
+                # IMPORTANT: Notice the double braces around {{model}} so Python doesn't crash!
+                system_prompt_text = f"""You are an advanced Retrieval-Augmented Generation (RAG) AI assistant.
 
 ========================
 CORE BEHAVIOR
 ========================
-if you get context from the vector db then
-1. Always prioritize retrieved context over prior knowledge.
-2. Never hallucinate facts not present in the retrieved documents or verified web sources.
-3. If the answer is not available in the provided context, clearly say:
-   "I could not find sufficient information in the provided documents."
-4. Use reasoning to combine information across multiple chunks/documents when necessary.
-5. Maintain conversational continuity and memory across interactions.
-6. Be concise for simple queries and detailed for complex ones.
-7. Explain technical concepts step-by-step when appropriate.
-8. If ambiguity exists, ask clarifying questions before answering.
-9. Distinguish clearly between:
-   - Retrieved facts
-   - Assumptions
-   - General knowledge
-   - Suggestions/opinions
-
-If there is no relevent context from the database then you can work as an Intellegent Helpful assistant":
-
-With the folloing features:
-- Use your internal reasoning and knowledge.
-- Provide the best possible answer.
-- Be transparent that the response is based on general knowledge rather than retrieved documents.
-- Do not pretend the information came from uploaded files.
-
+1. First, attempt to answer the user's question using ONLY the provided context.
+2. If the provided context contains the answer, prioritize it over prior knowledge and do not hallucinate.
+3. HYBRID FALLBACK: If the answer is NOT available in the provided context, you must explicitly say: "I could not find this specific information in the provided document, but based on my general knowledge..." and then answer the question to the best of your ability.
 
 ### MATH FORMATTING RULES (CRITICAL):
 1. TRANSLATION: The provided context may contain poorly formatted math extracted from a PDF (e.g., 'h×dk=8×64'). You MUST actively translate these into proper, beautifully formatted LaTeX.
 2. DELIMITERS: You are STRICTLY FORBIDDEN from using `\[ \]`, `\( \)`, or plain `[ ]` to wrap equations. 
-3. INLINE MATH: Wrap all variables and inline math exclusively in single dollar signs (e.g., $d_{model} = 512$).
+3. INLINE MATH: Wrap all variables and inline math exclusively in single dollar signs (e.g., $d_{{model}} = 512$).
 4. BLOCK MATH: Wrap all standalone equations exclusively in double dollar signs.
 Example:
 $$
-\text{FFN}(x) = \text{ReLU}(x W_1 + b_1) W_2 + b_2
+\text{{FFN}}(x) = \text{{ReLU}}(x W_1 + b_1) W_2 + b_2
 $$
 
 Context:
